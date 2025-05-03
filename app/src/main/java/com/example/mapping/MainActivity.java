@@ -7,47 +7,82 @@ import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.content.Context;
-import android.content.DialogInterface;
 import android.content.Intent;
+import android.content.pm.PackageManager;
+import android.graphics.Bitmap;
+import android.hardware.Sensor;
+import android.hardware.SensorEvent;
+import android.hardware.SensorEventListener;
+import android.hardware.SensorManager;
 import android.location.Location;
 import android.location.LocationListener;
 import android.location.LocationManager;
 import android.os.Build;
 import android.os.Bundle;
+import android.provider.MediaStore;
 import android.util.Log;
+import android.view.View;
+import android.widget.Button;
 import android.widget.CompoundButton;
+import android.widget.ImageView;
 import android.widget.Switch;
+import android.widget.TextView;
 import android.widget.Toast;
+import android.widget.EditText;
 
 import androidx.activity.result.ActivityResultCallback;
 import androidx.activity.result.ActivityResultLauncher;
 import androidx.activity.result.contract.ActivityResultContracts;
 import androidx.annotation.NonNull;
+import androidx.annotation.Nullable;
 import androidx.appcompat.app.AlertDialog;
 import androidx.appcompat.app.AppCompatActivity;
+import androidx.core.app.ActivityCompat;
 import androidx.core.app.NotificationCompat;
 import androidx.core.app.NotificationManagerCompat;
+import androidx.core.content.ContextCompat;
 
 import com.google.android.gms.tasks.OnFailureListener;
 import com.google.android.gms.tasks.OnSuccessListener;
+import com.google.firebase.auth.FirebaseAuth;
+import com.google.firebase.auth.FirebaseUser;
+import com.google.firebase.firestore.CollectionReference;
 import com.google.firebase.firestore.DocumentReference;
 import com.google.firebase.firestore.FirebaseFirestore;
+import com.google.firebase.firestore.FirebaseFirestoreException;
 import com.google.firebase.firestore.ListenerRegistration;
+import com.google.firebase.firestore.QueryDocumentSnapshot;
+import com.google.firebase.firestore.QuerySnapshot;
 import com.google.firebase.firestore.WriteBatch;
+import com.google.firebase.firestore.EventListener;
 
 import org.osmdroid.api.IMapController;
 import org.osmdroid.config.Configuration;
+import org.osmdroid.events.MapEventsReceiver;
 import org.osmdroid.tileprovider.tilesource.TileSourceFactory;
 import org.osmdroid.util.GeoPoint;
 import org.osmdroid.views.MapView;
 import org.osmdroid.views.overlay.Marker;
+import org.osmdroid.views.overlay.MapEventsOverlay;
+import org.osmdroid.views.overlay.Overlay;
 
-import java.util.Map;
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
 
-public class MainActivity extends AppCompatActivity {
+public class MainActivity extends AppCompatActivity implements MapEventsReceiver, SensorEventListener {
 
-    private Map<String, StoredLocation> storedLocations = new HashMap<String, StoredLocation>();
+    private static final int REQUEST_IMAGE_CAPTURE = 1;
+    private static final int DEFAULT_TRIGGER_DISTANCE = 100; // meters
+
+    private static final int REMINDER_TRIGGER_DISTANCE = 150; // meters
+
+    private Set<String> notifiedReminders = new HashSet<>();
+    private Map<String, StoredLocation> storedLocations = new HashMap<>();
+    private List<StoredLocation> reminders = new ArrayList<>();
     private MapView mapView;
     private ActivityResultLauncher<String[]> locationPermissionRequest;
     private LocationManager locationManager;
@@ -56,11 +91,20 @@ public class MainActivity extends AppCompatActivity {
     private final float minimumDistanceBetweenUpdates = 0.5f; // 0.5 meters
     private NotificationManagerCompat notificationManager;
     private FirebaseFirestore db;
-    private ListenerRegistration listenerRegistration;
-
-    // Define notification key for notification channel
+    private ListenerRegistration locationsListener;
+    private ListenerRegistration remindersListener;
+    private FirebaseAuth mAuth;
+    private FirebaseUser currentUser;
+    private SensorManager sensorManager;
+    private Sensor lightSensor;
+    private ActivityResultLauncher<Intent> cameraLauncher;
+    private ActivityResultLauncher<Intent> addReminderLauncher;
+    private ImageView previewImageView;
+    private Bitmap capturedImage;
     static final String NOTIFICATION_KEY = "MyLocation";
     static final int NOTIFICATION_INTENT_CODE = 0;
+
+    private Set<String> shownReminderDialogs = new HashSet<>();
 
     @SuppressLint("MissingPermission")
     @Override
@@ -69,214 +113,616 @@ public class MainActivity extends AppCompatActivity {
         Configuration.getInstance().setUserAgentValue(getPackageName());
         setContentView(R.layout.activity_main);
 
-        // Initialize Firestore
+        // Initialize Firebase
+        mAuth = FirebaseAuth.getInstance();
         db = FirebaseFirestore.getInstance();
 
-        mapView = findViewById(R.id.map);
-        mapView.setTileSource(TileSourceFactory.MAPNIK);
-        mapView.setMultiTouchControls(true);
-        Switch trackingSwitch = findViewById(R.id.trackingSwitch);
-        notificationManager = NotificationManagerCompat.from(getApplicationContext());
-        createNotificationChannel();
+        // Initialize UI components
+        initializeUI();
+        initializeMap();
+        initializeLocationTracking();
+        initializeFirestoreListeners();
+        initializeActivityLaunchers();
 
-        IMapController mapController = mapView.getController();
-        mapController.setZoom(6.0);
-        GeoPoint startPoint = new GeoPoint(52.8583, -2.2944);
-        mapController.setCenter(startPoint);
+        // Clear all notifications when app opens
+        if (notificationManager != null) {
+            notificationManager.cancelAll();
+        }
 
-        // Initialize locations and write to Firestore
-        initializeLocations();
+    }
 
-        trackingSwitch.setOnCheckedChangeListener(new CompoundButton.OnCheckedChangeListener() {
-            @Override
-            public void onCheckedChanged(CompoundButton buttonView, boolean isChecked) {
-                if (isChecked) {
-                    locationPermissionRequest.launch(new String[]{
-                            Manifest.permission.ACCESS_FINE_LOCATION,
-                            Manifest.permission.ACCESS_COARSE_LOCATION,
-                            Manifest.permission.POST_NOTIFICATIONS
-                    });
-                } else {
-                    if (locationManager != null) {
-                        locationManager.removeUpdates(locationListener);
-                    }
-                }
-            }
+    private void initializeUI() {
+        Button viewRemindersButton = findViewById(R.id.viewRemindersButton);
+        viewRemindersButton.setOnClickListener(v -> {
+            startActivity(new Intent(MainActivity.this, ReminderListActivity.class));
         });
 
-        // Initialize location listener
+        notificationManager = NotificationManagerCompat.from(this);
+        createNotificationChannel();
+    }
+
+    private void initializeMap() {
+        mapView = findViewById(R.id.map);
+        if (mapView != null) {
+            mapView.setTileSource(TileSourceFactory.MAPNIK);
+            mapView.setMultiTouchControls(true);
+            mapView.getOverlays().add(0, new MapEventsOverlay(this));
+
+            IMapController mapController = mapView.getController();
+            mapController.setZoom(6.0);
+            mapController.setCenter(new GeoPoint(52.8583, -2.2944));
+        }
+    }
+
+    private void initializeLocationTracking() {
         locationListener = new LocationListener() {
             @Override
             public void onLocationChanged(Location location) {
-                GeoPoint currentLocation = new GeoPoint(
-                        location.getLatitude(),
-                        location.getLongitude());
+                if (mapView == null) return;
 
-                // Loop over each StoredLocation in the HashMap
-                for (StoredLocation storedLocation : storedLocations.values()) {
-                    GeoPoint geoPoint = new GeoPoint(storedLocation.latitude, storedLocation.longitude);
-                    double distance = currentLocation.distanceToAsDouble(geoPoint);
-                    double triggerDistance = 100; // 100 meters
-
-                    if (distance < triggerDistance) {
-                        Toast.makeText(getApplicationContext(),
-                                "You are " + distance + " meters from " + storedLocation.locationName,
-                                Toast.LENGTH_LONG).show();
-
-                        if (!storedLocation.notificationActive && storedLocation.notificationsRequired) {
-                            int notificationID = storedLocation.locationName.hashCode();
-                            Notification notification = createNotification(storedLocation, distance);
-                            notificationManager.notify(notificationID, notification);
-                            storedLocation.notificationActive = true;
-                        }
-                    } else {
-                        storedLocation.notificationActive = false;
-                    }
-                }
-
-                mapView.getOverlays().clear();
-                Marker currentLocationMarker = new Marker(mapView);
-                currentLocationMarker.setPosition(currentLocation);
-                mapView.getOverlays().add(currentLocationMarker);
-                mapView.getController().animateTo(currentLocation);
-                mapView.invalidate();
-
-                Log.d("LocationUpdate", "Lat: " + location.getLatitude() + ", Lon: " + location.getLongitude());
+                GeoPoint currentLocation = new GeoPoint(location.getLatitude(), location.getLongitude());
+                updateUserLocationOnMap(currentLocation);
+                checkProximityToLocations(currentLocation);
+                checkProximityToReminders(currentLocation);
             }
         };
 
+        Switch trackingSwitch = findViewById(R.id.trackingSwitch);
+        if (trackingSwitch != null) {
+            trackingSwitch.setOnCheckedChangeListener((buttonView, isChecked) -> {
+                if (isChecked) {
+                    requestLocationPermissions();
+                } else if (locationManager != null) {
+                    locationManager.removeUpdates(locationListener);
+                }
+            });
+        }
+    }
+
+    private void initializeFirestoreListeners() {
+        currentUser = mAuth.getCurrentUser();
+        if (currentUser == null) {
+            signInAnonymously();
+            return;
+        }
+
+        // Listen for location changes
+        locationsListener = db.collection("locations")
+                .whereEqualTo("userId", currentUser.getUid())
+                .addSnapshotListener(this::handleLocationsUpdate);
+
+        // Listen for reminder changes
+        remindersListener = db.collection("reminders")
+                .whereEqualTo("userId", currentUser.getUid())
+                .addSnapshotListener(this::handleRemindersUpdate);
+    }
+
+    private void initializeActivityLaunchers() {
         locationPermissionRequest = registerForActivityResult(
                 new ActivityResultContracts.RequestMultiplePermissions(),
-                new ActivityResultCallback<Map<String, Boolean>>() {
-                    @Override
-                    public void onActivityResult(Map<String, Boolean> o) {
-                        if (o.get(Manifest.permission.ACCESS_FINE_LOCATION)) {
-                            Log.d("MyLocation", "Permission granted");
-                            updateLocation();
-                        } else {
-                            Log.d("MyLocation", "Permission denied");
+                result -> {
+                    if (Boolean.TRUE.equals(result.get(Manifest.permission.ACCESS_FINE_LOCATION))) {
+                        updateLocation();
+                    }
+                });
+
+        cameraLauncher = registerForActivityResult(
+                new ActivityResultContracts.StartActivityForResult(),
+                result -> {
+                    if (result.getResultCode() == RESULT_OK && result.getData() != null) {
+                        Bundle extras = result.getData().getExtras();
+                        if (extras != null) {
+                            capturedImage = (Bitmap) extras.get("data");
+                            if (previewImageView != null) {
+                                previewImageView.setImageBitmap(capturedImage);
+                                previewImageView.setVisibility(View.VISIBLE);
+                            }
                         }
+                    }
+                });
+
+        addReminderLauncher = registerForActivityResult(
+                new ActivityResultContracts.StartActivityForResult(),
+                result -> {
+                    if (result.getResultCode() == RESULT_OK) {
+                        Toast.makeText(this, "Reminder added!", Toast.LENGTH_SHORT).show();
                     }
                 });
     }
 
-    private void initializeLocations() {
-        StoredLocation location1 = new StoredLocation("City Campus", 52.1958, -2.2261);
-        StoredLocation location2 = new StoredLocation("Upton Snodsbury", 52.1874, -2.0888);
-        StoredLocation location3 = new StoredLocation("Beer", 50.69713, -3.10145);
+    private void handleLocationsUpdate(QuerySnapshot value, FirebaseFirestoreException error) {
+        if (error != null) {
+            Log.e("MainActivity", "Locations listener error", error);
+            return;
+        }
 
-        storedLocations.put(location1.locationName, location1);
-        storedLocations.put(location2.locationName, location2);
-        storedLocations.put(location3.locationName, location3);
-
-        WriteBatch batch = db.batch();
-        DocumentReference docRef1 = db.collection("locations").document(location1.locationName);
-        batch.set(docRef1, location1);
-        DocumentReference docRef2 = db.collection("locations").document(location2.locationName);
-        batch.set(docRef2, location2);
-        DocumentReference docRef3 = db.collection("locations").document(location3.locationName);
-        batch.set(docRef3, location3);
-
-        batch.commit()
-                .addOnSuccessListener(aVoid -> Log.d("MyLocation", "Successfully stored locations to Firebase"))
-                .addOnFailureListener(e -> Log.d("MyLocation", "Failed to store to Firebase", e));
+        if (value != null && mapView != null) {
+            storedLocations.clear();
+            for (QueryDocumentSnapshot doc : value) {
+                StoredLocation location = doc.toObject(StoredLocation.class);
+                storedLocations.put(location.locationName, location);
+            }
+            updateMapWithLocations();
+        }
     }
 
-    @SuppressLint("MissingPermission")
-    private void updateLocation() {
-        locationManager = (LocationManager) getSystemService(Context.LOCATION_SERVICE);
-        if (locationManager != null && locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER)) {
-            locationManager.requestLocationUpdates(
-                    LocationManager.GPS_PROVIDER,
-                    minimumTimeBetweenUpdates,
-                    minimumDistanceBetweenUpdates,
-                    locationListener
-            );
+    private void handleRemindersUpdate(QuerySnapshot value, FirebaseFirestoreException error) {
+        if (error != null) {
+            Log.e("MainActivity", "Reminders listener error", error);
+            return;
+        }
 
-            Location lastKnownLocation = locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER);
-            if (lastKnownLocation != null) {
-                locationListener.onLocationChanged(lastKnownLocation);
+        if (value != null) {
+            reminders = value.toObjects(StoredLocation.class);
+            updateMapWithReminders();
+        }
+    }
+
+    private void updateMapWithLocations() {
+        if (mapView == null) return;
+
+        // Add new location markers
+        for (StoredLocation location : storedLocations.values()) {
+            GeoPoint point = new GeoPoint(location.latitude, location.longitude);
+            Marker marker = new Marker(mapView);
+            marker.setPosition(point);
+            marker.setTitle(location.locationName);
+            marker.setIcon(getResources().getDrawable(R.drawable.marker_default_foreground));
+            mapView.getOverlays().add(marker);
+        }
+        mapView.invalidate();
+    }
+
+    private void updateMapWithReminders() {
+        if (mapView == null) return;
+
+        // Keep existing markers, just update their data
+        for (StoredLocation reminder : reminders) {
+            boolean markerExists = false;
+
+            // Check if marker already exists
+            for (Overlay overlay : mapView.getOverlays()) {
+                if (overlay instanceof Marker) {
+                    Marker existingMarker = (Marker) overlay;
+                    if (existingMarker.getTitle() != null &&
+                            existingMarker.getTitle().equals("REMINDER:" + reminder.locationName)) {
+                        markerExists = true;
+                        break;
+                    }
+                }
+            }
+
+            // Add new marker only if it doesn't exist
+            if (!markerExists) {
+                GeoPoint point = new GeoPoint(reminder.latitude, reminder.longitude);
+                Marker marker = new Marker(mapView);
+                marker.setPosition(point);
+                marker.setTitle("REMINDER:" + reminder.locationName);
+                marker.setSnippet(reminder.description);
+                marker.setIcon(getResources().getDrawable(R.drawable.ic_reminder_marker));
+                mapView.getOverlays().add(marker);
+            }
+        }
+        mapView.invalidate();
+    }
+    private void updateUserLocationOnMap(GeoPoint currentLocation) {
+        if (mapView == null) return;
+
+        // Clear existing user location marker
+        mapView.getOverlays().removeIf(overlay -> {
+            if (overlay instanceof Marker) {
+                Marker marker = (Marker) overlay;
+                return marker.getTitle() != null && marker.getTitle().equals("CURRENT_LOCATION");
+            }
+            return false;
+        });
+
+        // Add new user location marker
+        Marker currentLocationMarker = new Marker(mapView);
+        currentLocationMarker.setPosition(currentLocation);
+        currentLocationMarker.setTitle("CURRENT_LOCATION");
+        currentLocationMarker.setIcon(getResources().getDrawable(R.drawable.ic_current_location));
+        mapView.getOverlays().add(currentLocationMarker);
+        mapView.getController().animateTo(currentLocation);
+        mapView.invalidate();
+    }
+
+    private void checkProximityToLocations(GeoPoint currentLocation) {
+        for (StoredLocation location : storedLocations.values()) {
+            GeoPoint locationPoint = new GeoPoint(location.latitude, location.longitude);
+            double distance = currentLocation.distanceToAsDouble(locationPoint);
+
+            if (distance < DEFAULT_TRIGGER_DISTANCE) {
+                showLocationNotification(location, distance);
             }
         }
     }
 
+
+    //checks the proximity to a reminder
+
+    private void checkProximityToReminders(GeoPoint currentLocation) {
+        for (StoredLocation reminder : reminders) {
+            GeoPoint reminderPoint = new GeoPoint(reminder.latitude, reminder.longitude);
+            double distance = currentLocation.distanceToAsDouble(reminderPoint);
+            int triggerDistance = reminder.triggerDistance > 0 ? reminder.triggerDistance : REMINDER_TRIGGER_DISTANCE;
+
+            // Find the marker for this reminder
+            for (Overlay overlay : mapView.getOverlays()) {
+                if (overlay instanceof Marker) {
+                    Marker marker = (Marker) overlay;
+                    if (marker.getTitle() != null &&
+                            marker.getTitle().equals("REMINDER:" + reminder.locationName)) {
+
+                        // Update marker appearance based on proximity
+                        if (distance < triggerDistance) {
+                            marker.setIcon(getResources().getDrawable(R.drawable.ic_reminder_active));
+                            if (!notifiedReminders.contains(reminder.getId())) {
+                                showReminderNotification(reminder, distance);
+                                showReminderDialog(reminder, distance);
+                                notifiedReminders.add(reminder.getId());
+                            }
+                        } else {
+                            marker.setIcon(getResources().getDrawable(R.drawable.ic_reminder_marker));
+                            notifiedReminders.remove(reminder.getId());
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    private void showReminderDialog(StoredLocation reminder, double distance) {
+        runOnUiThread(() -> {
+            AlertDialog.Builder builder = new AlertDialog.Builder(this);
+            builder.setTitle("⏰ Reminder: " + reminder.title);
+
+            // Custom dialog layout with image
+            View dialogView = getLayoutInflater().inflate(R.layout.dialog_reminder_alert, null);
+            TextView distanceText = dialogView.findViewById(R.id.distanceText);
+            TextView descriptionText = dialogView.findViewById(R.id.descriptionText);
+            ImageView reminderImage = dialogView.findViewById(R.id.reminderImage);
+
+            distanceText.setText("You're " + (int)distance + "m away");
+            descriptionText.setText(reminder.description);
+
+            // Load image if available
+            if (reminder.photo != null && !reminder.photo.isEmpty()) {
+                try {
+                    Bitmap bitmap = ImageUtils.base64ToBitmap(reminder.photo);
+                    reminderImage.setImageBitmap(bitmap);
+                } catch (Exception e) {
+                    reminderImage.setVisibility(View.GONE);
+                }
+            } else {
+                reminderImage.setVisibility(View.GONE);
+            }
+
+            builder.setView(dialogView)
+                    .setPositiveButton("OK", null)
+                    .setOnDismissListener(dialog -> {
+                        // Optional: Add any cleanup here
+                    });
+
+            // Prevent dismissing when touching outside
+            AlertDialog dialog = builder.create();
+            dialog.setCanceledOnTouchOutside(false);
+            dialog.show();
+        });
+    }
+
+    private void updateLocation() {
+        if (ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION)
+                != PackageManager.PERMISSION_GRANTED) {
+            requestLocationPermissions();
+            return;
+        }
+
+        locationManager = (LocationManager) getSystemService(Context.LOCATION_SERVICE);
+        if (locationManager != null && locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER)) {
+            try {
+                locationManager.requestLocationUpdates(
+                        LocationManager.GPS_PROVIDER,
+                        minimumTimeBetweenUpdates,
+                        minimumDistanceBetweenUpdates,
+                        locationListener
+                );
+
+                Location lastKnownLocation = locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER);
+                if (lastKnownLocation != null) {
+                    locationListener.onLocationChanged(lastKnownLocation);
+                }
+            } catch (SecurityException e) {
+                Log.e("MainActivity", "Location permission not granted", e);
+            }
+        }
+    }
+
+    private void showLocationNotification(StoredLocation location, double distance) {
+        if (ActivityCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
+                != PackageManager.PERMISSION_GRANTED) {
+            return;
+        }
+
+        Notification notification = new NotificationCompat.Builder(this, NOTIFICATION_KEY)
+                .setSmallIcon(R.drawable.ic_notification)
+                .setContentTitle("Near " + location.locationName)
+                .setContentText("You are " + distance + " meters away")
+                .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+                .build();
+
+        notificationManager.notify(location.locationName.hashCode(), notification);
+    }
+
+    private void showReminderNotification(StoredLocation reminder, double distance) {
+        if (ActivityCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
+                != PackageManager.PERMISSION_GRANTED) {
+            return;
+        }
+
+        // Create an intent to open when notification is tapped
+        Intent intent = new Intent(this, MainActivity.class);
+        intent.putExtra("zoom_to_reminder", reminder.getId());
+        PendingIntent pendingIntent = PendingIntent.getActivity(
+                this,
+                0,
+                intent,
+                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE
+        );
+
+        // Build the notification
+        NotificationCompat.Builder builder = new NotificationCompat.Builder(this, NOTIFICATION_KEY)
+                .setSmallIcon(R.drawable.ic_notification)
+                .setContentTitle("Reminder: " + reminder.title)
+                .setContentText("You're " + (int) distance + "m away - " + reminder.description)
+                .setPriority(NotificationCompat.PRIORITY_HIGH)
+                .setContentIntent(pendingIntent)
+                .setAutoCancel(true);
+
+        // Add image if available
+        if (reminder.photo != null && !reminder.photo.isEmpty()) {
+            try {
+                Bitmap bitmap = ImageUtils.base64ToBitmap(reminder.photo);
+                builder.setStyle(new NotificationCompat.BigPictureStyle()
+                        .bigPicture(bitmap)
+                        .setBigContentTitle("Reminder: " + reminder.title)
+                        .setSummaryText(reminder.description));
+            } catch (Exception e) {
+                Log.e("Notification", "Error loading reminder image", e);
+            }
+        }
+
+        Notification notification = new NotificationCompat.Builder(this, NOTIFICATION_KEY)
+                .setSmallIcon(R.drawable.ic_notification)
+                .setContentTitle("Reminder: " + reminder.locationName)
+                .setContentText("You're " + distance + "m away - " + reminder.description)
+                .setPriority(NotificationCompat.PRIORITY_HIGH)
+                .build();
+
+        notificationManager.notify(("REMINDER_" + reminder.locationName).hashCode(), notification);
+    }
+
+    private void requestLocationPermissions() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            locationPermissionRequest.launch(new String[]{
+                    Manifest.permission.ACCESS_FINE_LOCATION,
+                    Manifest.permission.ACCESS_COARSE_LOCATION,
+                    Manifest.permission.POST_NOTIFICATIONS
+            });
+        } else {
+            locationPermissionRequest.launch(new String[]{
+                    Manifest.permission.ACCESS_FINE_LOCATION,
+                    Manifest.permission.ACCESS_COARSE_LOCATION
+            });
+        }
+    }
     private void createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             NotificationChannel channel = new NotificationChannel(
                     NOTIFICATION_KEY,
-                    "MyLocationChannel",
+                    "LocationReminders",
                     NotificationManager.IMPORTANCE_DEFAULT
             );
-            channel.setDescription("MyLocation updates");
-            NotificationManager notificationManager = getSystemService(NotificationManager.class);
-            notificationManager.createNotificationChannel(channel);
+            channel.setDescription("Notifications for location reminders");
+            NotificationManager manager = getSystemService(NotificationManager.class);
+            manager.createNotificationChannel(channel);
         }
     }
 
-    private Notification createNotification(StoredLocation storedLocation, double distance) {
-        Intent intent = new Intent(this, MainActivity.class);
-        intent.putExtra(NOTIFICATION_KEY, storedLocation.locationName);
+    @Override
+    public boolean longPressHelper(GeoPoint p) {
+        showLocationReminderChoiceDialog(p);
+        return true;
+    }
 
-        PendingIntent pendingIntent = PendingIntent.getActivity(
-                this,
-                NOTIFICATION_INTENT_CODE,
-                intent,
-                PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT
+    private void showLocationReminderChoiceDialog(GeoPoint point) {
+        new AlertDialog.Builder(this)
+                .setTitle("Create New")
+                .setItems(new String[]{"Location", "Reminder"}, (dialog, which) -> {
+                    if (which == 0) {
+                        showAddLocationDialog(point);
+                    } else {
+                        launchAddReminderActivity(point);
+                    }
+                })
+                .show();
+    }
+
+    private void launchAddReminderActivity(GeoPoint point) {
+        Intent intent = new Intent(this, AddReminderActivity.class);
+        intent.putExtra("latitude", point.getLatitude());
+        intent.putExtra("longitude", point.getLongitude());
+        addReminderLauncher.launch(intent);
+    }
+
+    private void showAddLocationDialog(GeoPoint geoPoint) {
+        View dialogView = getLayoutInflater().inflate(R.layout.dialog_add_location, null);
+        EditText titleEditText = dialogView.findViewById(R.id.titleEditText);
+        EditText descriptionEditText = dialogView.findViewById(R.id.descriptionEditText);
+        Button addPhotoButton = dialogView.findViewById(R.id.addPhotoButton);
+        previewImageView = dialogView.findViewById(R.id.reminderImageView);
+
+        addPhotoButton.setOnClickListener(v -> {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
+                launchCameraIntent();
+            } else {
+                ActivityCompat.requestPermissions(this, new String[]{Manifest.permission.CAMERA}, REQUEST_IMAGE_CAPTURE);
+            }
+        });
+
+        new AlertDialog.Builder(this)
+                .setTitle("Create New Location")
+                .setView(dialogView)
+                .setPositiveButton("Add", (dialog, which) -> {
+                    String title = titleEditText.getText().toString();
+                    String description = descriptionEditText.getText().toString();
+
+                    if (!title.isEmpty() && !description.isEmpty()) {
+                        saveNewLocation(geoPoint, title, description);
+                    } else {
+                        Toast.makeText(this, "Title and description are required", Toast.LENGTH_SHORT).show();
+                    }
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
+    private void saveNewLocation(GeoPoint geoPoint, String title, String description) {
+        StoredLocation newLocation = new StoredLocation(
+                title,
+                geoPoint.getLatitude(),
+                geoPoint.getLongitude(),
+                description,
+                capturedImage != null ? ImageUtils.bitmapToBase64(capturedImage) : null
         );
 
-        return new NotificationCompat.Builder(this, NOTIFICATION_KEY)
-                .setSmallIcon(R.drawable.marker_default_foreground)
-                .setContentTitle("Near " + storedLocation.locationName)
-                .setContentText("You are " + distance + " meters away")
-                .setContentIntent(pendingIntent)
-                .setAutoCancel(true)
-                .build();
+        if (currentUser != null) {
+            newLocation.userId = currentUser.getUid();
+        }
+
+        db.collection("locations").document(newLocation.locationName)
+                .set(newLocation)
+                .addOnSuccessListener(aVoid -> {
+                    Toast.makeText(this, "Location saved", Toast.LENGTH_SHORT).show();
+                    clearCapturedImage();
+                })
+                .addOnFailureListener(e -> {
+                    Toast.makeText(this, "Failed to save location", Toast.LENGTH_SHORT).show();
+                    Log.e("MainActivity", "Error saving location", e);
+                });
+    }
+
+    private void clearCapturedImage() {
+        capturedImage = null;
+        if (previewImageView != null) {
+            previewImageView.setVisibility(View.GONE);
+        }
+    }
+
+    private void launchCameraIntent() {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
+                != PackageManager.PERMISSION_GRANTED) {
+            ActivityCompat.requestPermissions(this,
+                    new String[]{Manifest.permission.CAMERA},
+                    REQUEST_IMAGE_CAPTURE);
+            return;
+        }
+
+        Intent takePictureIntent = new Intent(MediaStore.ACTION_IMAGE_CAPTURE);
+        if (takePictureIntent.resolveActivity(getPackageManager()) != null) {
+            cameraLauncher.launch(takePictureIntent);
+        }
     }
 
     @Override
-    protected void onNewIntent(Intent intent) {
-        super.onNewIntent(intent);
-        String locationName = intent.getStringExtra(NOTIFICATION_KEY);
-        if (locationName != null) {
-            StoredLocation location = storedLocations.get(locationName);
-            if (location != null) {
-                showNotificationDialog(location);
+    public void onRequestPermissionsResult(int requestCode,
+                                           @NonNull String[] permissions,
+                                           @NonNull int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+
+        if (requestCode == REQUEST_IMAGE_CAPTURE) {
+            if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                launchCameraIntent();
+            } else {
+                Toast.makeText(this, "Camera permission required", Toast.LENGTH_SHORT).show();
             }
         }
     }
 
-    private void showNotificationDialog(StoredLocation storedLocation) {
-        new AlertDialog.Builder(this)
-                .setTitle("Near " + storedLocation.locationName)
-                .setMessage("Do you want to continue to receive notifications for this location in the future?")
-                .setNegativeButton("NO", (dialog, which) -> {
-                    storedLocation.notificationsRequired = false;
-                    Toast.makeText(MainActivity.this,
-                            "Notifications disabled for " + storedLocation.locationName,
-                            Toast.LENGTH_SHORT).show();
-                })
-                .setPositiveButton("YES", (dialog, which) -> {
-                    storedLocation.notificationsRequired = true;
-                    Toast.makeText(MainActivity.this,
-                            "Notifications enabled for " + storedLocation.locationName,
-                            Toast.LENGTH_SHORT).show();
-                })
-                .create()
-                .show();
+    private void signInAnonymously() {
+        mAuth.signInAnonymously()
+                .addOnCompleteListener(this, task -> {
+                    if (task.isSuccessful()) {
+                        currentUser = mAuth.getCurrentUser();
+                        initializeFirestoreListeners();
+                    } else {
+                        Toast.makeText(this, "Authentication failed", Toast.LENGTH_SHORT).show();
+                    }
+                });
     }
+
+    // ... (other existing methods like onResume, onPause, etc.)
 
     @Override
     protected void onResume() {
         super.onResume();
-        mapView.onResume();
+
+        shownReminderDialogs.clear(); // Allow dialogs to show again
+        notifiedReminders.clear(); // Allow notifications to show again
+
+        if (getIntent() != null && getIntent().hasExtra("zoom_to_reminder")) {
+            String reminderId = getIntent().getStringExtra("zoom_to_reminder");
+            zoomToReminder(reminderId);
+            getIntent().removeExtra("zoom_to_reminder");
+        }
+
+        if (mapView != null) mapView.onResume();
+        if (sensorManager != null && lightSensor != null) {
+            sensorManager.registerListener(this, lightSensor, SensorManager.SENSOR_DELAY_NORMAL);
+        }
+
+    }
+
+
+    private void zoomToReminder(String reminderId) {
+        for (StoredLocation reminder : reminders) {
+            if (reminder.getId().equals(reminderId)) {
+                GeoPoint point = new GeoPoint(reminder.latitude, reminder.longitude);
+                mapView.getController().animateTo(point);
+                mapView.getController().setZoom(18.0);
+                break;
+            }
+        }
     }
 
     @Override
     protected void onPause() {
         super.onPause();
-        mapView.onPause();
-        if (locationManager != null) {
-            locationManager.removeUpdates(locationListener);
-        }
+        if (mapView != null) mapView.onPause();
+        if (sensorManager != null) sensorManager.unregisterListener(this);
+        if (locationManager != null) locationManager.removeUpdates(locationListener);
+    }
+
+    @Override
+    protected void onDestroy() {
+        super.onDestroy();
+        if (locationsListener != null) locationsListener.remove();
+        if (remindersListener != null) remindersListener.remove();
+    }
+
+    @Override
+    public boolean singleTapConfirmedHelper(GeoPoint p) {
+        return false;
+    }
+
+    @Override
+    public void onSensorChanged(SensorEvent event) {
+        // Light sensor handling
+    }
+
+    @Override
+    public void onAccuracyChanged(Sensor sensor, int accuracy) {
+        // Sensor accuracy handling
     }
 }

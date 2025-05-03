@@ -1,0 +1,39 @@
+{
+  "project_info": {
+    "project_number": "1055100411755",
+    "project_id": "mapping-8fcc4",
+    "storage_bucket": "mapping-8fcc4.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:1055100411755:android:b0badddbcf4b47077cf62e",
+        "android_client_info": {
+          "package_name": "com.example.mapping"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "1055100411755-dog66gfe3ig4s44fb1s8ufm4nf0ij1b2.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyByaXmyq5bbQxfeVVsLN5gKQA6JSVksCtE"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "1055100411755-dog66gfe3ig4s44fb1s8ufm4nf0ij1b2.apps.googleusercontent.com",
+              "client_type": 3
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
