@@ -10,6 +10,7 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.graphics.Bitmap;
+import android.graphics.Color;
 import android.hardware.Sensor;
 import android.hardware.SensorEvent;
 import android.hardware.SensorEventListener;
@@ -42,6 +43,8 @@ import androidx.core.app.NotificationCompat;
 import androidx.core.app.NotificationManagerCompat;
 import androidx.core.content.ContextCompat;
 
+import com.google.android.gms.auth.api.signin.GoogleSignIn;
+import com.google.android.gms.auth.api.signin.GoogleSignInOptions;
 import com.google.android.gms.tasks.OnFailureListener;
 import com.google.android.gms.tasks.OnSuccessListener;
 import com.google.firebase.auth.FirebaseAuth;
@@ -74,6 +77,8 @@ import java.util.Map;
 import java.util.Set;
 
 public class MainActivity extends AppCompatActivity implements MapEventsReceiver, SensorEventListener {
+
+    private Button logoutButton;
 
     private static final int REQUEST_IMAGE_CAPTURE = 1;
     private static final int DEFAULT_TRIGGER_DISTANCE = 100; // meters
@@ -113,9 +118,13 @@ public class MainActivity extends AppCompatActivity implements MapEventsReceiver
         Configuration.getInstance().setUserAgentValue(getPackageName());
         setContentView(R.layout.activity_main);
 
+        logoutButton = findViewById(R.id.logoutButton);
+
         // Initialize Firebase
         mAuth = FirebaseAuth.getInstance();
         db = FirebaseFirestore.getInstance();
+
+
 
         // Initialize UI components
         initializeUI();
@@ -124,11 +133,34 @@ public class MainActivity extends AppCompatActivity implements MapEventsReceiver
         initializeFirestoreListeners();
         initializeActivityLaunchers();
 
+
+        initializeLogoutButton();
+
         // Clear all notifications when app opens
         if (notificationManager != null) {
             notificationManager.cancelAll();
         }
 
+        initializeLogoutButton(); // Call the method here
+
+    }
+
+    private void initializeLogoutButton() {
+        Button logoutButton = findViewById(R.id.logoutButton);
+        logoutButton.setOnClickListener(v -> {
+            // Sign out from Firebase
+            mAuth.signOut();
+
+            // Sign out from Google
+            GoogleSignIn.getClient(this,
+                            new GoogleSignInOptions.Builder(GoogleSignInOptions.DEFAULT_SIGN_IN).build())
+                    .signOut()
+                    .addOnCompleteListener(task -> {
+                        // Redirect to LoginActivity
+                        startActivity(new Intent(this, LoginActivity.class));
+                        finish();
+                    });
+        });
     }
 
     private void initializeUI() {
@@ -182,19 +214,62 @@ public class MainActivity extends AppCompatActivity implements MapEventsReceiver
     private void initializeFirestoreListeners() {
         currentUser = mAuth.getCurrentUser();
         if (currentUser == null) {
-            signInAnonymously();
+            startActivity(new Intent(this, LoginActivity.class));
+            finish();
             return;
         }
 
-        // Listen for location changes
-        locationsListener = db.collection("locations")
-                .whereEqualTo("userId", currentUser.getUid())
-                .addSnapshotListener(this::handleLocationsUpdate);
-
-        // Listen for reminder changes
+        // Listen for reminder changes (both owned and shared)
         remindersListener = db.collection("reminders")
-                .whereEqualTo("userId", currentUser.getUid())
-                .addSnapshotListener(this::handleRemindersUpdate);
+                .whereArrayContains("sharedWith", currentUser.getUid())
+                .addSnapshotListener((value, error) -> {
+                    if (error != null) {
+                        Log.e("MainActivity", "Reminders listener error", error);
+                        return;
+                    }
+
+                    if (value != null) {
+                        List<StoredLocation> allReminders = new ArrayList<>();
+                        for (QueryDocumentSnapshot doc : value) {
+                            StoredLocation reminder = doc.toObject(StoredLocation.class);
+                            reminder.setId(doc.getId());
+                            allReminders.add(reminder);
+                        }
+
+                        // Also get reminders where creatorId matches current user
+                        db.collection("reminders")
+                                .whereEqualTo("creatorId", currentUser.getUid())
+                                .get()
+                                .addOnCompleteListener(task -> {
+                                    if (task.isSuccessful()) {
+                                        for (QueryDocumentSnapshot doc : task.getResult()) {
+                                            StoredLocation reminder = doc.toObject(StoredLocation.class);
+                                            reminder.setId(doc.getId());
+                                            if (!allReminders.contains(reminder)) {
+                                                allReminders.add(reminder);
+                                            }
+                                        }
+                                        reminders = allReminders;
+                                        updateMapWithReminders();
+                                    }
+                                });
+                    }
+                });
+    }
+
+
+    private void addLogoutButton() {
+        Button logoutButton = findViewById(R.id.logoutButton);
+        logoutButton.setOnClickListener(v -> {
+            mAuth.signOut();
+            GoogleSignIn.getClient(this,
+                            new GoogleSignInOptions.Builder(GoogleSignInOptions.DEFAULT_SIGN_IN).build())
+                    .signOut()
+                    .addOnCompleteListener(task -> {
+                        startActivity(new Intent(this, LoginActivity.class));
+                        finish();
+                    });
+        });
     }
 
     private void initializeActivityLaunchers() {
@@ -276,32 +351,28 @@ public class MainActivity extends AppCompatActivity implements MapEventsReceiver
     private void updateMapWithReminders() {
         if (mapView == null) return;
 
-        // Keep existing markers, just update their data
+        // Clear existing reminder markers
+        mapView.getOverlays().removeIf(overlay -> {
+            if (overlay instanceof Marker) {
+                Marker marker = (Marker) overlay;
+                return marker.getTitle() != null && marker.getTitle().startsWith("REMINDER:");
+            }
+            return false;
+        });
+
+        // Add all reminder markers
         for (StoredLocation reminder : reminders) {
-            boolean markerExists = false;
+            GeoPoint point = new GeoPoint(reminder.latitude, reminder.longitude);
+            Marker marker = new Marker(mapView);
+            marker.setPosition(point);
+            marker.setTitle("REMINDER:" + reminder.title);
+            marker.setSnippet(reminder.description);
 
-            // Check if marker already exists
-            for (Overlay overlay : mapView.getOverlays()) {
-                if (overlay instanceof Marker) {
-                    Marker existingMarker = (Marker) overlay;
-                    if (existingMarker.getTitle() != null &&
-                            existingMarker.getTitle().equals("REMINDER:" + reminder.locationName)) {
-                        markerExists = true;
-                        break;
-                    }
-                }
-            }
+            // Set default red icon
+            marker.setIcon(ContextCompat.getDrawable(this, R.drawable.ic_reminder_marker));
+            marker.getIcon().setTint(Color.RED);
 
-            // Add new marker only if it doesn't exist
-            if (!markerExists) {
-                GeoPoint point = new GeoPoint(reminder.latitude, reminder.longitude);
-                Marker marker = new Marker(mapView);
-                marker.setPosition(point);
-                marker.setTitle("REMINDER:" + reminder.locationName);
-                marker.setSnippet(reminder.description);
-                marker.setIcon(getResources().getDrawable(R.drawable.ic_reminder_marker));
-                mapView.getOverlays().add(marker);
-            }
+            mapView.getOverlays().add(marker);
         }
         mapView.invalidate();
     }
@@ -347,23 +418,24 @@ public class MainActivity extends AppCompatActivity implements MapEventsReceiver
             double distance = currentLocation.distanceToAsDouble(reminderPoint);
             int triggerDistance = reminder.triggerDistance > 0 ? reminder.triggerDistance : REMINDER_TRIGGER_DISTANCE;
 
-            // Find the marker for this reminder
             for (Overlay overlay : mapView.getOverlays()) {
                 if (overlay instanceof Marker) {
                     Marker marker = (Marker) overlay;
                     if (marker.getTitle() != null &&
-                            marker.getTitle().equals("REMINDER:" + reminder.locationName)) {
+                            marker.getTitle().equals("REMINDER:" + reminder.title)) {
 
-                        // Update marker appearance based on proximity
                         if (distance < triggerDistance) {
-                            marker.setIcon(getResources().getDrawable(R.drawable.ic_reminder_active));
+                            // Change to light blue when in range
+                            marker.getIcon().setTint(Color.parseColor("#ADD8E6"));
+
                             if (!notifiedReminders.contains(reminder.getId())) {
                                 showReminderNotification(reminder, distance);
                                 showReminderDialog(reminder, distance);
                                 notifiedReminders.add(reminder.getId());
                             }
                         } else {
-                            marker.setIcon(getResources().getDrawable(R.drawable.ic_reminder_marker));
+                            // Change back to red when out of range
+                            marker.getIcon().setTint(Color.RED);
                             notifiedReminders.remove(reminder.getId());
                         }
                         break;
@@ -521,10 +593,9 @@ public class MainActivity extends AppCompatActivity implements MapEventsReceiver
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             NotificationChannel channel = new NotificationChannel(
                     NOTIFICATION_KEY,
-                    "LocationReminders",
-                    NotificationManager.IMPORTANCE_DEFAULT
-            );
-            channel.setDescription("Notifications for location reminders");
+                    "Reminder Notifications",
+                    NotificationManager.IMPORTANCE_HIGH);
+            channel.setDescription("Notifications for reminder proximity alerts");
             NotificationManager manager = getSystemService(NotificationManager.class);
             manager.createNotificationChannel(channel);
         }
